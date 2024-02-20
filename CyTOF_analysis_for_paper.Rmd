@@ -1,0 +1,398 @@
+---
+title: "CyTOF Analysis"
+author: "Kilian Merz"
+date: "January 9th, 2023"
+output:
+  bookdown::html_document2:
+    toc: true
+    toc_depth: 4
+    toc_float:
+      collapsed: true
+    number_sections: true
+    fig_caption: true
+    code_folding: show
+    code_download: true
+    code_dir: "code"
+    self_contained: false
+    theme: "cosmo"
+---
+
+# Library
+
+```{r}
+library(tidyverse)
+library(tidytof)
+library(lme4)
+library(flowCore)
+library(tidyverse)
+library(dplyr)
+library(ggbeeswarm)
+library(rstatix)
+library(viridis) 
+library(grid)
+library(ggrepel)
+library(cowplot)
+library(stringr)
+library(ggprism)
+library(ComplexHeatmap)
+library(ggpubr)
+library(readxl)
+```
+
+```{r}
+theme_main <- theme(panel.grid.major = element_blank(), 
+                    panel.grid.minor = element_blank(),
+                    panel.spacing = unit(0.2, "lines"), 
+                    panel.background=element_rect(fill="white"),
+                    panel.border = element_blank(),
+                    plot.title = element_text(face = "bold",
+                                              size = rel(1.2), hjust = 0.5),
+                    plot.subtitle=element_text(face = "bold",hjust = 0.5, size=rel(1),vjust=1),
+                    axis.title = element_text(face = "bold",size = rel(1.2)),
+                    axis.ticks = element_line(),
+                    axis.ticks.length = unit(.25, "cm"),
+                    axis.line = element_line(size = 0.5),
+                    axis.text = element_text(size = rel(1), color = 'black'),
+                    legend.key = element_blank(),
+                    legend.position = "right",
+                    legend.text = element_text(size=rel(1), face="bold"),
+                    legend.key.size= unit(0.7, "cm"),
+                    legend.title = element_text(size=rel(1)),
+                    plot.margin=unit(c(10,5,5,5),"mm"),
+                    strip.background=element_blank(),
+                    strip.text = element_text(face="bold"))
+```
+
+# Data Preparation
+
+## Import
+
+```{r}
+data_pre <- tof_read_data("path", sep = "_", panel_info = read.csv("path")) |> 
+  mutate(ID = gsub("_(.)*", "", file_name))
+```
+
+```{r}
+titer <- read_excel("path") |>
+  mutate(ID = as.character(ID)) 
+```
+
+## Merging
+
+```{r}
+data_processed <- 
+  data_pre |> 
+  tof_preprocess() |> 
+  mutate(ID = gsub("_(.)*", "", file_name))|>
+  inner_join(titer, by = "ID")
+
+head(data_processed)
+```
+
+## Filtering
+
+```{r}
+# Remove lowest quartile of CD45 expression
+summary(data_processed$CD45_Y89)
+data_processed <- data_processed |>
+  dplyr::filter(CD45_Y89 > 1.842)
+
+# Include only samples with at least 30k cells
+data_processed <- data_processed %>%
+  group_by(ID) %>%
+  dplyr::filter(n() >= 30000) %>%
+  ungroup()
+```
+
+```{r}
+data <- data_processed
+```
+
+```{r}
+# Change class of columns to prevent confusion when choosing numeric columns
+data <- data |>
+  dplyr::mutate(Time = as.character(Time),
+                Width = as.character(Width),
+                Residual = as.character(Residual))
+
+# Set correct channel names to match panel information
+names(data)[names(data) == "Tim-3_Tb159"] <- "Tim3_Tb159"
+names(data)[names(data) == "PD-1_Lu175"] <- "PD1_Lu175"
+names(data)[names(data) == "LAG-3_Ho165"] <- "LAG3_Ho165"
+
+# Load Panel info
+panel <- read.csv("path")
+
+# Remove Di from metal names
+panel$fcs_colname <- gsub("Di", "", panel$metals)
+
+# Has to match the name in the fcs files
+panel$antigen[panel$antigen == "HLADR"] <- "HLA-DR"
+
+# Remove 103Rh as a live/dead stain
+panel <- panel |>
+  dplyr::filter(antigen != "103Rh")
+
+# Make sure only channels in out panel are included
+data_wide <- data |>
+  select(matches(paste0("^", paste(panel$antigen, collapse="|"), "_")), names(titer))
+
+# Correctly set names
+numeric_columns <- names(data_wide[sapply(data_wide, is.numeric)])
+numeric_columns <- numeric_columns[numeric_columns != "BAU"]
+names(data_wide)[names(data_wide) %in% numeric_columns] <- gsub("_(.)*"
+                                                                     , "",
+                                                                     names(data_wide)[names(data_wide) %in% numeric_columns])
+
+numeric_columns <- names(data_wide[sapply(data_wide, is.numeric)])
+numeric_columns <- numeric_columns[numeric_columns != "BAU"]
+```
+
+# Exploratory Analysis
+
+```{r BAU Heatmap, fig.height=4.5, fig.width=8}
+# Generate heatmap with mean expression of each marker per patient to check for overall expression
+data_heatmap <- data_wide |>
+  group_by(ID)|>
+  summarise(across(numeric_columns, mean)) |>
+  left_join(titer, by="ID") |>
+  mutate(Responder= case_when(
+    BAU <= 113 ~ "Non-Responder",
+    BAU > 113 ~ "Responder"
+  ))|>
+  column_to_rownames("ID")
+
+row_annotation <- HeatmapAnnotation(BAU = data_heatmap$BAU,
+                                    which = "row",
+                                    border = TRUE)
+
+patient_heatmap <- data_heatmap %>% 
+  dplyr::select(numeric_columns)|> 
+  as.matrix()|> 
+  Heatmap(cluster_columns = TRUE, left_annotation = row_annotation, 
+          show_column_dend = FALSE,
+          border = TRUE,
+          split = data_heatmap$Responder)
+
+ggarrange(grid.grabExpr(draw(patient_heatmap)))
+```
+
+```{r}
+# Filter out samples 5020, 5115  and 5099 due to overall low marker expression
+data_wide <- data_wide |>
+  dplyr::filter(ID != "5020", ID != "5115", ID != "5099")
+```
+
+## Clustering
+
+```{r}
+# Perform FlowSOM clustering
+numeric_columns <- names(data_wide[sapply(data_wide, is.numeric)])
+numeric_columns <- numeric_columns[numeric_columns != "BAU"]
+
+set.seed(1234)
+data_clustered <- tof_cluster(data_wide,method = "flowsom", cluster_cols = numeric_columns, num_metaclusters = 20)
+
+data_clustered <- data_clustered |>
+  mutate(.flowsom_metacluster = as.character(.flowsom_metacluster))
+```
+
+## Heatmap
+
+```{r Cluster Heatmap}
+# Generate Heatmap with marker expression per cluster
+numeric_columns <- names(data_wide[sapply(data_wide, is.numeric)])
+numeric_columns <- numeric_columns[numeric_columns != "BAU"]
+
+data_heatmap <- data_clustered |>
+  group_by(.flowsom_metacluster)|>
+  summarise(across(numeric_columns, mean)) |>
+  ungroup()|>
+  pivot_longer(cols = numeric_columns, names_to = "Marker", values_to = "Expression")|>
+  group_by(Marker) %>%
+  mutate(Expression = (Expression - min(Expression)) / (max(Expression) - min(Expression))) |>
+  ungroup() |>
+  pivot_wider(names_from = Marker, values_from = Expression, id_cols = .flowsom_metacluster)|>
+  column_to_rownames(".flowsom_metacluster")
+
+
+count_annotation <- data_clustered|>
+  group_by(.flowsom_metacluster)|>
+  summarise(count = n())|>
+  column_to_rownames(".flowsom_metacluster")|>
+  as.vector()
+
+count_annotation <- rowAnnotation(count = anno_barplot(count_annotation,
+                                                       gp = gpar(fill = "lightgrey")))
+Heatmap(as.matrix(data_heatmap), col = rev(hcl.colors(10, "YlGnBu")),
+        right_annotation = count_annotation,
+        row_title = "Clusters",
+        heatmap_legend_param = list(title = "Expression"),
+        rect_gp = gpar(col = "black", lwd = 0.5))
+```
+
+## Annotation
+
+```{r}
+# Import manual annotation table and merge with clustered data
+annotation <- read_excel("path") |>
+  dplyr::mutate(.flowsom_metacluster = as.character(.flowsom_metacluster))
+
+data_clustered <- data_clustered |>
+  left_join(annotation, by=".flowsom_metacluster")
+```
+
+```{r, fig.height=4, fig.width=10}
+# Generate cell type expression heatmap
+data_heatmap <- data_clustered |>
+  group_by(Cell_type)|>
+  summarise(across(numeric_columns, mean)) |>
+  ungroup()|>
+  pivot_longer(cols = numeric_columns, names_to = "Marker", values_to = "Expression")|>
+#  group_by(Marker) %>%
+  mutate(Expression = (Expression - min(Expression)) / (max(Expression) - min(Expression))) |>
+ # ungroup() |>
+  pivot_wider(names_from = Marker, values_from = Expression, id_cols = Cell_type)|>
+  column_to_rownames("Cell_type")
+
+
+count_annotation <- data_clustered|>
+  group_by(Cell_type)|>
+  summarise(count = n())|>
+  column_to_rownames("Cell_type")|>
+  as.vector()
+
+count_annotation <- rowAnnotation("Cell Count" = anno_barplot(count_annotation,
+                                                       gp = gpar(fill = "lightgrey")))
+hm <- Heatmap(as.matrix(data_heatmap), col = rev(paletteer_c("grDevices::Spectral", 30)[0:15]),
+        right_annotation = count_annotation,
+        heatmap_legend_param = list(title = "Normalised Expression [AU]",
+                                      legend_height = unit(5, "cm"),
+                                      title_position = "lefttop-rot", border = "black"),
+        rect_gp = gpar(col = "black", lwd = 0.5))
+
+expr_heatmap <- grid.grabExpr(draw(hm, heatmap_legend_side = "left"))
+
+ggarrange(expr_heatmap)
+```
+
+## UMAP
+
+```{r}
+# Perform UMAP on a sample on 50000 cells
+data_UMAP_pre <- data_clustered[sample(nrow(data_clustered), 50000), ] |>
+  dplyr::select(-c(BAU))
+
+data_UMAP <- data_UMAP_pre |>
+  dplyr::select(numeric_columns)|>
+  umap::umap() 
+
+data_UMAP <- as.data.frame(data_UMAP$layout)|>
+    cbind(data_UMAP_pre)
+
+library(paletteer)
+
+mycolors <- paletteer_d("ggsci::default_igv")
+mycolors[13]<- "#3182BD"
+UMAP <- data_UMAP|>
+  ggplot(aes(x = V1, y = V2, col=Population)) + 
+  geom_point(size=0.5) + 
+#  facet_grid(~Timepoint) +
+  scale_color_manual(values = mycolors) +
+  theme_cowplot() + 
+  labs(fill = NULL)+
+  guides(color = guide_legend(override.aes = list(size = 5), ncol=1)) 
+
+UMAP+labs(x="UMAP1", y="UMAP2")
+```
+
+```{r,eval=TRUE, , fig.height=10, fig.width=14}
+# Map the expression of each marker on the UMAP
+expression_umap <- data_UMAP |> 
+  pivot_longer(cols=numeric_columns, names_to = "target", values_to="value")|>
+  group_by(target)|>
+  mutate(value=(value-min(value))/(max(value)-min(value)))|>
+  ungroup()|>
+  ggplot(aes(x = V1, y = V2, col = value)) + 
+  geom_point(size=1) + 
+  facet_wrap(~target) +
+  scale_color_viridis()+
+  theme_cowplot() + 
+  theme(strip.background = element_blank())+
+  guides(fill = guide_legend(title = "Normalised Expression [AU]"))
+
+expression_umap
+´
+```
+
+# Differential Analysis
+
+```{r}
+# Add responder classification
+data_clustered  <- data_clustered|>
+  mutate(Responder= case_when(
+    BAU <= 113 ~ "Non-Responder",
+    BAU > 113 ~ "Responder"
+  ))
+```
+
+## Cluster Abundance
+
+### ttest
+
+```{r}
+daa_result <- 
+  data_clustered |> 
+  tof_analyze_abundance(
+    cluster_col = Cell_type, 
+    effect_col = Responder, 
+    group_cols = ID, 
+    test_type = "unpaired", 
+    method = "ttest"
+  )
+
+daa_result 
+```
+
+```{r, fig.height=4, fig.width=4}
+# Count how many cells per cluster
+cluster_prop <- data_clustered |> 
+  tof_extract_proportion(
+    cluster_col = Cell_type, 
+    group_cols = c(Responder, ID),
+    format = "long"
+  )
+
+stat.test <- cluster_prop |>
+  group_by(Cell_type)|>
+  t_test(prop ~ Responder) |>
+  adjust_pvalue(method = "BH")|>
+  add_significance("p.adj")|>
+  add_xy_position(x="Responder")|>
+  dplyr::filter(p.adj < 0.05)
+
+cluster_diff <- cluster_prop |>
+  dplyr::filter(Cell_type %in% daa_result$Cell_type[daa_result$p_adj < 0.05])|>
+  ggplot(aes(x=Responder, y=prop))+
+  geom_quasirandom(aes(col = Responder), size=2, alpha=0.75, width = 0.2)+
+#  geom_boxplot(fill="white", alpha=0, size=0.5)+
+  geom_errorbar(stat = "summary",width=0.4 , size=1,aes(ymax=..y..,ymin=..y..),fun = "mean")+
+  stat_summary(fun.data = "mean_sd", geom = "errorbar", width = 0.2,  aes(group = Responder)) +
+  facet_wrap(~Cell_type,  nrow = 1, scales="free_y")+
+    theme_cowplot()+
+  theme(axis.text.x  = element_text(angle = 45, hjust = 1,  vjust = 1))+
+  scale_color_manual(values = c("Non-Responder" = "#B72E48", "Responder" = "#2574AF"))+
+  stat_pvalue_manual(stat.test, label = "p.adj.signif",
+                     size = 8, y.position = c(0.15, 0.12))+
+  xlab("")+
+  ylab("Cluster Proportion")+
+#  ylim(0,0.15)+
+  guides(color="none")+
+
+  theme(strip.background = element_blank())+
+  scale_y_continuous(expand = expansion(mult = c(0.1, 0.15)))
+
+cluster_diff
+```
+
+

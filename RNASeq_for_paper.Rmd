@@ -1,0 +1,239 @@
+---
+title: "Cancer Covid RNASeq"
+author: "Kilian Merz"
+date: "December 7th, 2023"
+output:
+  bookdown::html_document2:
+    toc: true
+    toc_depth: 4
+    toc_float:
+      collapsed: true
+    number_sections: true
+    fig_caption: true
+    code_folding: show
+    code_download: true
+    code_dir: "code"
+    self_contained: false
+    theme: "cosmo"
+---
+
+# Library 
+
+```{r}
+# load libraries
+library(tidyverse)
+library(beeswarm)
+library(cluster)
+library(factoextra)
+library(readxl)
+library(umap)
+library(DESeq2)
+library(ggprism)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(stringr)
+library(ggpubr)
+library(ComplexHeatmap)
+library(rstatix)
+```
+
+```{r}
+theme_main <- theme(panel.grid.major = element_blank(), 
+                    panel.grid.minor = element_blank(),
+                    panel.spacing = unit(0.2, "lines"), 
+                    panel.background=element_rect(fill="white"),
+                    panel.border = element_blank(),
+                    plot.title = element_text(face = "bold",
+                                              size = rel(1), hjust = 0.5),
+                    plot.subtitle=element_text(face = "bold",hjust = 0.5, size=rel(1),vjust=1),
+                    axis.title = element_text(face = "bold",size = rel(1)),
+                    axis.ticks = element_line(),
+                    axis.ticks.length = unit(.25, "cm"),
+                    axis.line = element_line(size = 0.5),
+                    axis.text = element_text(size = rel(1), color = 'black'),
+                    legend.key = element_blank(),
+                    legend.position = "right",
+                    legend.text = element_text(size=rel(0.8)),
+                    legend.key.size= unit(0.7, "cm"),
+                    legend.title = element_text(size=rel(1)),
+                    plot.margin=unit(c(10,5,5,5),"mm"),
+                    strip.background=element_blank(),
+                    strip.text = element_text(face="bold"))
+```
+
+# DESeq2
+
+```{r}
+# Read in antibody titer data
+titer <- read_excel("Cancer_Covid_titer.xlsx")|>
+    mutate(ID = as.character(ID))
+
+# Read in counts data
+counts_data <- read.csv('27068_countMatrix.csv')
+head(counts_data)
+
+# Select samples corresponding to this study
+sampleIDs <- as.character(c(4730, 4731, 4748, 4749, 4763, 4764, 4783, 4795, 4810,4944, 4813, 4864, 4957, 4962, 5125, 5061))
+
+# Read in sample info and add Responder category
+colData <- read.csv('meta_27068.csv')|>
+  dplyr::filter(ID %in% sampleIDs) |>
+  mutate(fastID = str_extract(FASTQ_FILE, "\\d+")) |>
+  left_join(titer, by="ID") |>
+  dplyr::select(BAU, fastID, ID) |>
+  mutate(Responder= case_when( 
+    BAU <= 113 ~ "Non_Responder",
+    BAU > 113 ~ "Responder"
+  ))|> 
+  column_to_rownames("fastID") |>
+  dplyr::select(Responder) |>
+  na.omit()
+
+
+
+counts_data <- counts_data |>
+  column_to_rownames("X")
+
+colnames(counts_data) <- str_extract(colnames(counts_data), "\\d+")
+counts_data <- counts_data|>
+  dplyr::select(any_of(rownames(colData))) 
+  
+# making sure the row names in colData matches to column names in counts_data
+all(colnames(counts_data) %in% rownames(colData))
+
+# are they in the same order?
+all(colnames(counts_data) == rownames(colData))
+```
+
+
+```{r}
+# Construct a DESeqDataSet object
+
+dds <- DESeqDataSetFromMatrix(countData = counts_data,
+                       colData = colData,
+                       design = ~ Responder)
+
+# pre-filtering: removing rows with low gene counts
+# keeping rows that have at least 10 reads total
+keep <- rowSums(counts(dds)) >= 10
+dds <- dds[keep,]
+
+# set the factor level
+dds$Responder <- relevel(dds$Responder, ref = "Responder")
+
+# Run DESeq
+dds <- DESeq(dds)
+res <- results(dds)
+```
+
+```{r}
+# Convert Ensemble IDs into gene symbols for volcano plot annotation
+ensembl_ids <- sub("\\..*$", "", rownames(res))
+gene_symbols <- mapIds(org.Hs.eg.db, keys = ensembl_ids, keytype = "ENSEMBL", column = "SYMBOL")
+
+# Add gene symbols as a new column in DESeqDataSet
+res$gene_symbol <- gene_symbols[match(ensembl_ids, names(gene_symbols))]
+
+
+```
+
+
+```{r}
+# Volcano plot
+sig_results <- as.data.frame(res) |>
+  rownames_to_column("ENSEMBL") |>
+  na.omit()
+
+volcano <- sig_results |>
+  mutate(label = case_when(
+    (log2FoldChange > 5 | log2FoldChange < -5) &padj < 0.05 ~ gene_symbol
+  ),
+  neg_log10p = -log10(padj)
+  )|>
+  mutate(change = ifelse(
+    log2FoldChange > 0 & padj < 0.05,"upregulated", 
+    ifelse(
+      log2FoldChange < -0 & padj < 0.05, "downregulated",
+      "not significant"
+    )
+    
+  ))|>
+  ggplot(aes(x=log2FoldChange,
+             y = neg_log10p,
+             label = label,
+             col = change)) +xs
+  geom_point(alpha=0.5) +
+#  scale_color_brewer(palette = "RdBu")+
+ #   scale_color_gradient2(low = "blue", mid = "orange", high = "red") + # Add the diverging color palette
+  theme_bw(base_size = 16)+
+  xlab("log2(FoldChange Non-Responder vs. Responder)")+
+  ylab("-log10(p-value)")+
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed")+
+#  geom_vline(xintercept = 5, linetype = "dashed")+
+  geom_vline(xintercept = 0, linetype = "dashed")+
+  geom_label_repel(point.padding = 5, show.legend = FALSE)+
+  theme_main+
+  guides(color=guide_legend(title="Significance"))+
+  xlim(-30,30)+
+    guides(color = "none")+
+  scale_color_manual(values=c("#B72E48","grey","#2574AF"))+
+  theme_cowplot()
+```
+
+```{r, fig.width=3, fig.height=3.5}
+# Plot number of up or down regulated genes
+barplot <- sig_results |>
+    mutate(label = case_when(
+    (log2FoldChange > 5 | log2FoldChange < -5) &padj < 0.05 ~ gene_symbol
+  ),
+  neg_log10p = -log10(padj)
+  )|>
+  mutate(change = ifelse(
+    log2FoldChange > 0 & padj < 0.05,"upregulated", 
+    ifelse(
+      log2FoldChange < -0 & padj < 0.05, "downregulated",
+      "not significant"
+    )))|>
+  dplyr::filter(change != "not significant")|>
+  ggplot(aes(x="Genes", fill=change))+
+    geom_bar(stat="count")+
+  geom_text(stat = "count", aes(label = stat(count)),
+            position = position_stack(vjust = 0.5), size = 3.5, col="white") + 
+    scale_fill_manual(values=c("#B72E48","#2574AF"))+
+#  theme_main+
+ # guides(fill = "none")+
+  ylab("Number of Genes")+
+  scale_y_continuous(expand = c(0,0)) +
+  theme_cowplot()
+
+barplot+xlab("")+theme(axis.text.x = element_blank(),
+                       axis.ticks.x = element_blank())
+```
+
+# Enrichment
+
+```{r}
+ensembl_ids <- sub("\\..*$", "", rownames(res))
+
+# Convert Ensemble IDs to ENTREZ IDs
+entrez <- mapIds(org.Hs.eg.db, keys = ensembl_ids, keytype = "ENSEMBL", column = "ENTREZID")
+
+# Add ENTREZ ID as a new column in DESeqDataSet
+res$ENTREZ <- entrez[match(ensembl_ids, names(entrez))]
+```
+
+
+```{r}
+# Perform KEGG enrichment on downregulated genes
+DE_genes <- res$ENTREZ[res$padj < 0.05 & res$log2FoldChange < 0]
+
+enrich_result <- enrichKEGG(gene = DE_genes, organism = 'hsa', keyType = 'kegg', pvalueCutoff = 0.05)
+
+# Plot pathways relevant to the hypothesis
+KEGG_down <-dotplot(enrich_result, showCategory=c("Cytokine-cytokine receptor interaction",
+                "TNF signaling pathway",
+                "IL-17 signaling pathway",
+                "TGF-beta signaling pathway", 
+                "NF-kappa B signaling pathway"))
+```
